@@ -3,8 +3,8 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 
 use tiny_skia::{
-    ClipMask, Color, FillRule, Path, PathBuilder, Pixmap, PixmapMut, PixmapPaint, Point, Rect,
-    Transform,
+    ClipMask, Color, FillRule, IntRect, Path, PathBuilder, Pixmap, PixmapMut, PixmapPaint, Point,
+    Rect, Stroke, Transform,
 };
 
 use smithay_client_toolkit::reexports::client::protocol::wl_shm;
@@ -39,6 +39,12 @@ use title::TitleText;
 /// XXX this is not result, so `must_use` when needed.
 type SkiaResult = Option<()>;
 
+const SHADOW_SRC: &[u8] = include_bytes!("frame_shadow.png");
+const SHADOW_SIZE: i32 = 64;
+const SHADOW_BOTTOM_MARGIN: i32 = 29;
+const SHADOW_TOP_MARGIN: i32 = 23;
+const SHADOW_SIDE_MARGIN: i32 = 26;
+
 /// A simple set of decorations
 #[derive(Debug)]
 pub struct AdwaitaFrame<State> {
@@ -70,6 +76,12 @@ pub struct AdwaitaFrame<State> {
     theme: ColorTheme,
     title: Option<String>,
     title_text: Option<TitleText>,
+
+    top_shadow: Pixmap,
+    bottom_shadow: Pixmap,
+    side_shadow: Pixmap,
+    top_corner_shadow: Pixmap,
+    bottom_corner_shadow: Pixmap,
 }
 
 impl<State> AdwaitaFrame<State>
@@ -94,6 +106,74 @@ where
 
         let theme = frame_config.theme;
 
+        let shadow_src = tiny_skia::Pixmap::decode_png(SHADOW_SRC).unwrap();
+        assert_eq!((shadow_src.width(), shadow_src.height()), (64, 128));
+
+        let pixels = shadow_src.data().chunks_exact(4).collect::<Vec<_>>();
+        let top_pixels = &pixels[..(SHADOW_SIZE * SHADOW_SIZE) as _];
+        let bottom_pixels = &pixels[(SHADOW_SIZE * SHADOW_SIZE) as _..];
+
+        let top_corner_shadow = Pixmap::from_vec(
+            top_pixels
+                .iter()
+                .copied()
+                .flatten()
+                .copied()
+                .collect::<Vec<_>>(),
+            IntRect::from_xywh(0, 0, SHADOW_SIZE as _, SHADOW_SIZE as _)
+                .unwrap()
+                .size(),
+        )
+        .unwrap();
+        let bottom_corner_shadow = Pixmap::from_vec(
+            bottom_pixels
+                .iter()
+                .copied()
+                .flatten()
+                .copied()
+                .collect::<Vec<_>>(),
+            IntRect::from_xywh(0, 0, SHADOW_SIZE as _, SHADOW_SIZE as _)
+                .unwrap()
+                .size(),
+        )
+        .unwrap();
+        let side_shadow = Pixmap::from_vec(
+            (&top_pixels[top_pixels.len() - SHADOW_SIZE as usize..])
+                .iter()
+                .copied()
+                .flatten()
+                .copied()
+                .collect::<Vec<_>>(),
+            IntRect::from_xywh(0, 0, SHADOW_SIZE as _, 1)
+                .unwrap()
+                .size(),
+        )
+        .unwrap();
+        let bottom_shadow = Pixmap::from_vec(
+            bottom_pixels
+                .chunks_exact(SHADOW_SIZE as _)
+                .map(|f| *f.last().unwrap())
+                .flatten()
+                .copied()
+                .collect::<Vec<_>>(),
+            IntRect::from_xywh(0, 0, 1, SHADOW_SIZE as _)
+                .unwrap()
+                .size(),
+        )
+        .unwrap();
+        let top_shadow = Pixmap::from_vec(
+            top_pixels
+                .chunks_exact(SHADOW_SIZE as _)
+                .map(|f| *f.last().unwrap())
+                .flatten()
+                .copied()
+                .collect::<Vec<_>>(),
+            IntRect::from_xywh(0, 0, 1, SHADOW_SIZE as _)
+                .unwrap()
+                .size(),
+        )
+        .unwrap();
+
         Ok(AdwaitaFrame {
             base_surface,
             decorations,
@@ -109,6 +189,11 @@ where
             state: WindowState::empty(),
             wm_capabilities: WindowManagerCapabilities::all(),
             resizable: true,
+            top_shadow,
+            bottom_shadow,
+            side_shadow,
+            top_corner_shadow,
+            bottom_corner_shadow,
         })
     }
 
@@ -118,25 +203,25 @@ where
         self.dirty = true;
     }
 
-    fn precise_location(&self, location: Location, header_width: u32, x: f64, y: f64) -> Location {
+    fn precise_location(&self, location: Location, height: u32, x: f64, y: f64) -> Location {
         match location {
             Location::Head | Location::Button(_) => self.buttons.find_button(x, y),
-            Location::Top | Location::TopLeft | Location::TopRight => {
-                if x <= f64::from(BORDER_SIZE) {
+            Location::Left | Location::TopLeft | Location::BottomLeft => {
+                if y <= f64::from(BORDER_SIZE) {
                     Location::TopLeft
-                } else if x >= f64::from(header_width + BORDER_SIZE) {
-                    Location::TopRight
+                } else if y >= f64::from(height - BORDER_SIZE) {
+                    Location::BottomLeft
                 } else {
-                    Location::Top
+                    Location::Left
                 }
             }
-            Location::Bottom | Location::BottomLeft | Location::BottomRight => {
-                if x <= f64::from(BORDER_SIZE) {
-                    Location::BottomLeft
-                } else if x >= f64::from(header_width + BORDER_SIZE) {
+            Location::Right | Location::TopRight | Location::BottomRight => {
+                if y <= f64::from(BORDER_SIZE) {
+                    Location::TopRight
+                } else if y >= f64::from(height - BORDER_SIZE) {
                     Location::BottomRight
                 } else {
-                    Location::Bottom
+                    Location::Right
                 }
             }
             other => other,
@@ -203,11 +288,39 @@ where
             };
 
             // Create the pixmap and fill with transparent color.
-            let mut pixmap = PixmapMut::from_bytes(canvas, width, height)?;
+            let pixmap = &mut PixmapMut::from_bytes(canvas, width, height)?;
 
             // Fill everything with transparent background, since we draw rounded corners and
             // do invisible borders to enlarge the input zone.
             pixmap.fill(Color::TRANSPARENT);
+
+            // The visible border is one pt.
+            let visible_border_size = VISIBLE_BORDER_SIZE * scale;
+
+            let draw_shadow_part = |dst: &mut PixmapMut,
+                                    src: &Pixmap,
+                                    scale_x: i32,
+                                    scale_y: i32,
+                                    translate_x: i32,
+                                    translate_y: i32| {
+                dst.draw_pixmap(
+                    0, // this seems to have rounding issues
+                    0, // so use transforms instead
+                    src.as_ref(),
+                    &PixmapPaint {
+                        opacity: colors.shadow_opacity,
+                        ..Default::default()
+                    },
+                    Transform::default()
+                        .post_scale(scale as _, scale as _)
+                        .post_scale(scale_x as _, scale_y as _)
+                        .post_translate(
+                            (translate_x * scale as i32) as f32,
+                            (translate_y * scale as i32) as f32,
+                        ),
+                    None,
+                );
+            };
 
             match idx {
                 DecorationParts::HEADER => {
@@ -217,7 +330,7 @@ where
                     }
 
                     draw_headerbar(
-                        &mut pixmap,
+                        pixmap,
                         self.title_text.as_ref().map(|t| t.pixmap()).unwrap_or(None),
                         scale as f32,
                         self.resizable,
@@ -227,51 +340,158 @@ where
                         self.mouse.location,
                     );
                 }
-                border => {
-                    // The visible border is one pt.
-                    let visible_border_size = VISIBLE_BORDER_SIZE * scale;
-
-                    // XXX we do all the match using integral types and then convert to f32 in the
-                    // end to ensure that result is finite.
-                    let rect = match border {
-                        DecorationParts::LEFT => {
+                DecorationParts::LEFT => {
+                    draw_shadow_part(
+                        pixmap,
+                        &self.side_shadow,
+                        1,
+                        part.height as i32
+                            - BORDER_SIZE as i32 * 2
+                            - (SHADOW_SIZE - SHADOW_TOP_MARGIN)
+                            - (SHADOW_SIZE - SHADOW_BOTTOM_MARGIN),
+                        BORDER_SIZE as i32 - SHADOW_SIDE_MARGIN,
+                        BORDER_SIZE as i32 + (SHADOW_SIZE - SHADOW_TOP_MARGIN),
+                    );
+                    draw_shadow_part(
+                        pixmap,
+                        &self.top_corner_shadow,
+                        1,
+                        1,
+                        BORDER_SIZE as i32 - SHADOW_SIDE_MARGIN,
+                        BORDER_SIZE as i32 - SHADOW_TOP_MARGIN,
+                    );
+                    draw_shadow_part(
+                        pixmap,
+                        &self.bottom_corner_shadow,
+                        1,
+                        1,
+                        BORDER_SIZE as i32 - SHADOW_SIDE_MARGIN,
+                        part.height as i32
+                            - BORDER_SIZE as i32
+                            - (SHADOW_SIZE - SHADOW_BOTTOM_MARGIN),
+                    );
+                    pixmap.fill_rect(
+                        {
                             let x = (pos.0.unsigned_abs() * scale) - visible_border_size;
                             let y = pos.1.unsigned_abs() * scale;
                             Rect::from_xywh(
                                 x as f32,
                                 y as f32,
                                 visible_border_size as f32,
-                                (height - y) as f32,
+                                (height - y - BORDER_SIZE * scale + visible_border_size) as f32,
                             )
-                        }
-                        DecorationParts::RIGHT => {
-                            let y = pos.1.unsigned_abs() * scale;
-                            Rect::from_xywh(
-                                0.,
-                                y as f32,
-                                visible_border_size as f32,
-                                (height - y) as f32,
-                            )
-                        }
-                        // We draw small visible border only bellow the window surface, no need to
-                        // handle `TOP`.
-                        DecorationParts::BOTTOM => {
-                            let x = (pos.0.unsigned_abs() * scale) - visible_border_size;
-                            Rect::from_xywh(
-                                x as f32,
-                                0.,
-                                (width - 2 * x) as f32,
-                                visible_border_size as f32,
-                            )
-                        }
-                        _ => None,
-                    };
-
-                    // Fill the visible border, if present.
-                    if let Some(rect) = rect {
-                        pixmap.fill_rect(rect, &border_paint, Transform::identity(), None);
-                    }
+                            .unwrap()
+                        },
+                        &border_paint,
+                        Transform::identity(),
+                        None,
+                    );
                 }
+                DecorationParts::RIGHT => {
+                    draw_shadow_part(
+                        pixmap,
+                        &self.side_shadow,
+                        -1,
+                        part.height as i32
+                            - BORDER_SIZE as i32 * 2
+                            - (SHADOW_SIZE - SHADOW_TOP_MARGIN)
+                            - (SHADOW_SIZE - SHADOW_BOTTOM_MARGIN),
+                        SHADOW_SIDE_MARGIN,
+                        BORDER_SIZE as i32 + (SHADOW_SIZE - SHADOW_TOP_MARGIN),
+                    );
+                    draw_shadow_part(
+                        pixmap,
+                        &self.top_corner_shadow,
+                        -1,
+                        1,
+                        SHADOW_SIDE_MARGIN,
+                        BORDER_SIZE as i32 - SHADOW_TOP_MARGIN,
+                    );
+                    draw_shadow_part(
+                        pixmap,
+                        &self.bottom_corner_shadow,
+                        -1,
+                        1,
+                        SHADOW_SIDE_MARGIN,
+                        part.height as i32
+                            - BORDER_SIZE as i32
+                            - (SHADOW_SIZE - SHADOW_BOTTOM_MARGIN),
+                    );
+                    pixmap.fill_rect(
+                        {
+                            let y = pos.1.unsigned_abs() * scale;
+                            Rect::from_xywh(
+                                0.,
+                                y as f32,
+                                visible_border_size as f32,
+                                (height - y - BORDER_SIZE * scale + visible_border_size) as f32,
+                            )
+                            .unwrap()
+                        },
+                        &border_paint,
+                        Transform::identity(),
+                        None,
+                    );
+                }
+                DecorationParts::BOTTOM => {
+                    draw_shadow_part(
+                        pixmap,
+                        &self.bottom_shadow,
+                        part.width as i32 - (SHADOW_SIZE - SHADOW_SIDE_MARGIN) * 2,
+                        1,
+                        SHADOW_SIZE - SHADOW_SIDE_MARGIN,
+                        -SHADOW_SIZE + SHADOW_BOTTOM_MARGIN,
+                    );
+                    draw_shadow_part(
+                        pixmap,
+                        &self.bottom_corner_shadow,
+                        1,
+                        1,
+                        -SHADOW_SIDE_MARGIN,
+                        -SHADOW_SIZE + SHADOW_BOTTOM_MARGIN,
+                    );
+                    draw_shadow_part(
+                        pixmap,
+                        &self.bottom_corner_shadow,
+                        -1,
+                        1,
+                        part.width as i32 + SHADOW_SIDE_MARGIN,
+                        -SHADOW_SIZE + SHADOW_BOTTOM_MARGIN,
+                    );
+                    pixmap.fill_rect(
+                        Rect::from_xywh(0., 0., width as f32, visible_border_size as f32).unwrap(),
+                        &border_paint,
+                        Transform::identity(),
+                        None,
+                    );
+                }
+                DecorationParts::TOP => {
+                    draw_shadow_part(
+                        pixmap,
+                        &self.top_shadow,
+                        part.width as i32 - (SHADOW_SIZE - SHADOW_SIDE_MARGIN) * 2,
+                        1,
+                        SHADOW_SIZE - SHADOW_SIDE_MARGIN,
+                        BORDER_SIZE as i32 - SHADOW_TOP_MARGIN,
+                    );
+                    draw_shadow_part(
+                        pixmap,
+                        &self.top_corner_shadow,
+                        1,
+                        1,
+                        -SHADOW_SIDE_MARGIN,
+                        BORDER_SIZE as i32 - SHADOW_TOP_MARGIN,
+                    );
+                    draw_shadow_part(
+                        pixmap,
+                        &self.top_corner_shadow,
+                        -1,
+                        1,
+                        part.width as i32 + SHADOW_SIDE_MARGIN,
+                        BORDER_SIZE as i32 - SHADOW_TOP_MARGIN,
+                    );
+                }
+                _ => {}
             };
 
             part.surface.set_buffer_scale(scale as i32);
@@ -401,15 +621,11 @@ where
 
     fn click_point_moved(&mut self, surface: &WlSurface, x: f64, y: f64) -> Option<&str> {
         let decorations = self.decorations.as_ref()?;
-        let location = decorations.find_surface(surface);
-        if location == Location::None {
-            return None;
-        }
+        let Some((location, part)) = decorations.find_surface(surface) else { return None };
 
-        let header_width = decorations.header().width;
         let old_location = self.mouse.location;
 
-        let location = self.precise_location(location, header_width, x, y);
+        let location = self.precise_location(location, part.height, x, y);
         let new_cursor = self.mouse.moved(location, x, y, self.resizable);
 
         // Set dirty if we moved the cursor between the buttons.
@@ -569,12 +785,27 @@ fn draw_headerbar_bg(
         CORNER_RADIUS as f32 * scale
     };
 
-    let bg = rounded_headerbar_shape(0., 0., w, h, radius)?;
-
     pixmap.fill_path(
-        &bg,
+        &rounded_headerbar_shape(0., 0., w, h, radius)?,
         &colors.headerbar_paint(),
         FillRule::Winding,
+        Transform::identity(),
+        None,
+    );
+
+    pixmap.stroke_path(
+        &rounded_headerbar_shape(
+            scale / 2.,
+            scale / 2.,
+            w - scale,
+            h - scale,
+            radius - scale / 2.,
+        )?,
+        &colors.border_paint(),
+        &Stroke {
+            width: VISIBLE_BORDER_SIZE as f32 * scale,
+            ..Default::default()
+        },
         Transform::identity(),
         None,
     );

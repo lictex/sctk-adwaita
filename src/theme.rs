@@ -1,7 +1,7 @@
 pub use tiny_skia::Color;
 use tiny_skia::{Paint, Shader};
 
-pub(crate) const BORDER_SIZE: u32 = 10;
+pub(crate) const BORDER_SIZE: u32 = 30;
 pub(crate) const HEADER_SIZE: u32 = 35;
 pub(crate) const CORNER_RADIUS: u32 = 10;
 pub(crate) const VISIBLE_BORDER_SIZE: u32 = 1;
@@ -34,6 +34,7 @@ impl ColorTheme {
                 button_icon: Color::from_rgba8(42, 42, 42, 255),
                 border_color: Color::from_rgba8(220, 220, 220, 255),
                 font_color: Color::from_rgba8(47, 47, 47, 255),
+                shadow_opacity: 1.0,
             },
             inactive: ColorMap {
                 headerbar: Color::from_rgba8(250, 250, 250, 255),
@@ -42,6 +43,7 @@ impl ColorTheme {
                 button_icon: Color::from_rgba8(148, 148, 148, 255),
                 border_color: Color::from_rgba8(220, 220, 220, 255),
                 font_color: Color::from_rgba8(150, 150, 150, 255),
+                shadow_opacity: 0.5,
             },
         }
     }
@@ -56,6 +58,7 @@ impl ColorTheme {
                 button_icon: Color::from_rgba8(255, 255, 255, 255),
                 border_color: Color::from_rgba8(58, 58, 58, 255),
                 font_color: Color::from_rgba8(255, 255, 255, 255),
+                shadow_opacity: 1.0,
             },
             inactive: ColorMap {
                 headerbar: Color::from_rgba8(36, 36, 36, 255),
@@ -64,6 +67,7 @@ impl ColorTheme {
                 button_icon: Color::from_rgba8(144, 144, 144, 255),
                 border_color: Color::from_rgba8(58, 58, 58, 255),
                 font_color: Color::from_rgba8(144, 144, 144, 255),
+                shadow_opacity: 0.5,
             },
         }
     }
@@ -92,6 +96,7 @@ pub struct ColorMap {
     pub button_icon: Color,
     pub border_color: Color,
     pub font_color: Color,
+    pub shadow_opacity: f32,
 }
 
 impl ColorMap {
@@ -129,6 +134,7 @@ impl ColorMap {
     pub(crate) fn border_paint(&self) -> Paint {
         Paint {
             shader: Shader::SolidColor(self.border_color),
+            anti_alias: true,
             ..Default::default()
         }
     }
